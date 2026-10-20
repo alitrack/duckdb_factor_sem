@@ -19,8 +19,10 @@ with open("test/raw40.txt") as fh:
     RAW = fh.read().strip()
 
 # ---- Part 3: efa ----
-A = run_case(40, 6, 2, seed=7, method="pca", rotate="varimax")
-B = run_case(30, 4, 1, seed=8, method="pa", rotate="none")
+A = run_case(40, 6, 2, seed=7, method="pca", rot="varimax")
+B = run_case(30, 4, 1, seed=8, method="pa", rot="none")
+C = run_case(60, 6, 2, seed=11, method="minres", rot="varimax")   # v0.2.1
+D = run_case(60, 8, 2, seed=44, method="minres", rot="promax")    # v0.2.1 (oblique: phi != I)
 data_str = lambda c: " | ".join(" ".join(f"{x:.6f}" for x in row) for row in c["data"])
 lr = lambda c, i, k: c["loadings_rotated"][i][k]
 
@@ -43,6 +45,8 @@ CREATE OR REPLACE TEMP TABLE fit_cov AS SELECT cfa_cov('{COV}', '1') AS j;
 CREATE OR REPLACE TEMP TABLE fit_raw AS SELECT cfa_fit('{RAW}', '1') AS j;
 CREATE OR REPLACE TEMP TABLE efa_a AS SELECT efa('{data_str(A)}', '2', 'pca', 'varimax') AS j;
 CREATE OR REPLACE TEMP TABLE efa_b AS SELECT efa('{data_str(B)}', '1', 'pa', 'none') AS j;
+CREATE OR REPLACE TEMP TABLE efa_c AS SELECT efa('{data_str(C)}', '2', 'minres', 'varimax') AS j;
+CREATE OR REPLACE TEMP TABLE efa_d AS SELECT efa('{data_str(D)}', '2', 'minres', 'promax') AS j;
 
 CREATE OR REPLACE TEMP TABLE checks AS
   SELECT 'cov.meta.p'  AS label, (num((SELECT j FROM fit_cov),'p') = 4) AS p
@@ -77,13 +81,24 @@ CREATE OR REPLACE TEMP TABLE checks AS
   UNION ALL SELECT 'efaB.meta.q', (num((SELECT j FROM efa_b),'q') = 1)
   UNION ALL SELECT 'efaB.eig0',   ok(num((SELECT j FROM efa_b),'eigenvalues[0]'), {B['eigenvalues'][0]!r}, 1e-3)
   UNION ALL SELECT 'efaB.srml',   ok(num((SELECT j FROM efa_b),'srml'), {B['srml']!r}, 1e-3)
+  UNION ALL SELECT 'efaC.meta.p', (num((SELECT j FROM efa_c),'p') = 6)
+  UNION ALL SELECT 'efaC.meta.q', (num((SELECT j FROM efa_c),'q') = 2)
+  UNION ALL SELECT 'efaC.method', (json_extract_string((SELECT j FROM efa_c), '$.method') = 'minres')
+  UNION ALL SELECT 'efaC.eig0',   ok(num((SELECT j FROM efa_c),'eigenvalues[0]'), {C['eigenvalues'][0]!r}, 1e-3)
+  UNION ALL SELECT 'efaC.srml',   ok(num((SELECT j FROM efa_c),'srml'), {C['srml']!r}, 5e-3)
+  UNION ALL SELECT 'efaC.phi00',  ok(num((SELECT j FROM efa_c),'phi[0][0]'), {C['phi'][0][0]!r}, 1e-3)
+  UNION ALL SELECT 'efaD.meta.p', (num((SELECT j FROM efa_d),'p') = 8)
+  UNION ALL SELECT 'efaD.rotate', (json_extract_string((SELECT j FROM efa_d), '$.rotate') = 'promax')
+  UNION ALL SELECT 'efaD.eig0',   ok(num((SELECT j FROM efa_d),'eigenvalues[0]'), {D['eigenvalues'][0]!r}, 1e-3)
+  UNION ALL SELECT 'efaD.srml',   ok(num((SELECT j FROM efa_d),'srml'), {D['srml']!r}, 5e-3)
+  UNION ALL SELECT 'efaD.phi00',  ok(num((SELECT j FROM efa_d),'phi[0][0]'), {D['phi'][0][0]!r}, 1e-3)
   UNION ALL SELECT 'err.q0',      (cfa_fit('1 2 3 | 2 3 4 | 3 4 5', '0') IS NULL)
   UNION ALL SELECT 'err.qneg',    (cfa_fit('1 2 3 | 2 3 4 | 3 4 5', '-1') IS NULL)
   UNION ALL SELECT 'err.badd',    (cfa_fit('a b c | d e f | g h i', '1') IS NULL)
   UNION ALL SELECT 'err.q_gt_p',  (cfa_fit('1 2 | 3 4 | 5 6', '2') IS NULL)
   UNION ALL SELECT 'err.cov_n',   (cfa_cov('1 2 1.0 0.5 0.5 1.0', '1') IS NULL)
   UNION ALL SELECT 'err.efa_badmethod', (efa('1 2 | 3 4 | 5 6', '1', 'ml', 'none') IS NULL)
-  UNION ALL SELECT 'err.efa_badrot',    (efa('1 2 | 3 4 | 5 6', '1', 'pca', 'promax') IS NULL);
+  UNION ALL SELECT 'err.efa_badrot',    (efa('1 2 | 3 4 | 5 6', '1', 'pca', 'quartmax') IS NULL);
 
 SELECT
   COUNT(*) AS n_checks,
@@ -94,5 +109,6 @@ FROM checks;
 with open("test/test_factor.sql", "w") as fh:
     fh.write(sql)
 print(f"wrote test/test_factor.sql: efaA eig0={A['eigenvalues'][0]:.6f} srml={A['srml']:.6f} "
-      f"lr00={lr(A,0,0):.4f} lr01={lr(A,0,1):.4f}; efaB eig0={B['eigenvalues'][0]:.6f} srml={B['srml']:.6f}")
-print(f"total checks: {33} (cov 14 + raw 4 + efa 8 + err 6) = {14+4+8+6}")
+      f"lr00={lr(A,0,0):.4f} lr01={lr(A,0,1):.4f}; efaB eig0={B['eigenvalues'][0]:.6f} srml={B['srml']:.6f}; "
+      f"efaC(minres/varimax) eig0={C['eigenvalues'][0]:.6f}; efaD(minres/promax) eig0={D['eigenvalues'][0]:.6f}")
+print(f"total checks: {14+4+13+6} (cov 14 + raw 4 + efa 13 + err 6)")

@@ -9,7 +9,7 @@
 //! Sign convention: each factor column's largest-|loading| is positive.
 
 use crate::math::jacobi_eig;
-use crate::math::{matmul, trans};
+use crate::math::{invert, matmul, trans};
 
 pub struct EfaResult {
     pub p: usize,
@@ -24,6 +24,7 @@ pub struct EfaResult {
     pub lambda_rot: Vec<f64>, // rotated loadings p x q row-major
     pub uniquenesses: Vec<f64>, // p
     pub communality: Vec<f64>, // p
+    pub phi: Vec<f64>, // factor correlation q x q (identity for orthogonal)
     pub srml: f64, // SRMR over upper triangle incl. diagonal
     pub rotate_iters: usize,
 }
@@ -150,11 +151,385 @@ fn pa_loadings(r: &[f64], p: usize, q: usize, max_iter: usize, tol: f64) -> Opti
     Some((lam, w_desc, iters))
 }
 
+/// SMC (Sata et al.) start for the uniqueness diagonal: 1 - 1/diag(inv R).
+/// Mirrors psych::smc (cov2cor already applied, so R has unit diagonal).
+fn smc(r: &[f64], p: usize) -> Vec<f64> {
+    let mut inv = match invert(r, p) {
+        Some(x) => x,
+        None => return vec![1.0f64; p],
+    };
+    let mut out = vec![0.0f64; p];
+    for j in 0..p {
+        let d = inv[j * p + j];
+        out[j] = if d.abs() < 1e-12 {
+            1.0
+        } else {
+            (1.0 - 1.0 / d).clamp(0.0, 1.0)
+        };
+    }
+    out
+}
+
+/// Given a uniqueness diagonal Psi, return the minres reduced-matrix loadings
+/// (p x q) and the reproduced model L L' (p x p). Mirrors psych::fa:
+/// reduced = R with diag <- 1 - Psi, eigen, top-q eigenvectors * sqrt(w).
+fn minres_reduced(r: &[f64], psi: &[f64], p: usize, q: usize) -> (Vec<f64>, Vec<f64>) {
+    let mut s = r.to_vec();
+    for j in 0..p {
+        s[j * p + j] = 1.0 - psi[j];
+    }
+    let (w, v) = jacobi_eig(&s, p);
+    let mut order: Vec<usize> = (0..p).collect();
+    order.sort_by(|a, b| w[*b].partial_cmp(&w[*a]).unwrap_or(std::cmp::Ordering::Equal));
+    let mut lam = vec![0.0f64; p * q];
+    for j in 0..q {
+        let wj = w[order[j]].max(1e-300);
+        for i in 0..p {
+            lam[i * q + j] = v[i * p + order[j]] * wj.sqrt();
+        }
+    }
+    let lt = trans(&lam, p, q);
+    let model = matmul(&lam, p, q, &lt, p);
+    (lam, model)
+}
+
+/// Minres objective: sum of the strictly-lower-triangular squares of
+/// (R - (L L')), where L L' comes from the reduced matrix at Psi.
+/// Mirrors psych::fit.residuals for fm=minres (lower.tri of (S - model)^2).
+fn minres_obj(r: &[f64], psi: &[f64], p: usize, q: usize) -> f64 {
+    let (_lam, model) = minres_reduced(r, psi, p, q);
+    let mut acc = 0.0f64;
+    for i in 1..p {
+        for j in 0..i {
+            let d = r[i * p + j] - model[i * p + j];
+            acc += d * d;
+        }
+    }
+    acc
+}
+
+/// Minres gradient w.r.t. Psi: diag(model + diag(Psi) - R). Mirrors
+/// psych::FAgr.minres.
+fn minres_grad(r: &[f64], psi: &[f64], p: usize, q: usize) -> Vec<f64> {
+    let (_lam, model) = minres_reduced(r, psi, p, q);
+    let mut g = vec![0.0f64; p];
+    for j in 0..p {
+        g[j] = model[j * p + j] + psi[j] - r[j * p + j];
+    }
+    g
+}
+
+/// Two-loop L-BFGS-B (Nocedal & Wright) with box bounds and backtracking
+/// Armijo line search. Minimize f(x) over x in [lo, hi] elementwise.
+/// Returns (x, f(x), iterations).
+fn lbfgsb_b(
+    f: impl Fn(&[f64]) -> f64,
+    g: impl Fn(&[f64]) -> Vec<f64>,
+    x0: &[f64],
+    lo: &[f64],
+    hi: &[f64],
+    m: usize,
+    max_iter: usize,
+    tol: f64,
+) -> (Vec<f64>, f64, usize) {
+    let p = x0.len();
+    let clip = |v: f64, j: usize| -> f64 { v.clamp(lo[j], hi[j]) };
+    let mut x = x0.to_vec();
+    let mut fx = f(&x);
+    let mut gx = g(&x);
+    let mut s_hist: Vec<Vec<f64>> = Vec::new(); // s = x_new - x
+    let mut y_hist: Vec<Vec<f64>> = Vec::new(); // y = g_new - g
+    let mut rho_hist: Vec<f64> = Vec::new(); // 1 / (y's)
+    let mut alpha_hist: Vec<f64> = Vec::new();
+    let mut iters = 0;
+    for _ in 0..max_iter {
+        iters += 1;
+        // two-loop recursion to form search direction d (from current g)
+        let k = s_hist.len();
+        let mut alpha = vec![0.0f64; k];
+        let mut r = gx.clone();
+        // backward pass (i = k-1 .. 0)
+        for i in (0..k).rev() {
+            let mut yst = 0.0f64;
+            let mut srt = 0.0f64;
+            for t in 0..p {
+                yst += y_hist[i][t] * s_hist[i][t];
+                srt += s_hist[i][t] * r[t];
+            }
+            alpha[i] = rho_hist[i] * srt;
+            for t in 0..p {
+                r[t] -= (alpha[i] - rho_hist[i] * yst) * y_hist[i][t];
+            }
+        }
+        // gamma from the most recent pair
+        let gamma = if k == 0 {
+            1.0
+        } else {
+            let j = k - 1;
+            let mut yst = 0.0f64;
+            let mut srt = 0.0f64;
+            for t in 0..p {
+                yst += y_hist[j][t] * s_hist[j][t];
+                srt += s_hist[j][t] * r[t];
+            }
+            srt / yst
+        };
+        let mut d = vec![0.0f64; p];
+        for t in 0..p {
+            d[t] = gamma * r[t];
+        }
+        // forward pass (i = 0 .. k-1): d <- d + (alpha_i - beta_i) s_i,
+        // beta_i = rho_i * y_i . d  (dot with the running direction)
+        for i in 0..k {
+            let mut beta = 0.0f64;
+            for t in 0..p {
+                beta += y_hist[i][t] * d[t];
+            }
+            beta *= rho_hist[i];
+            for t in 0..p {
+                d[t] += (alpha[i] - beta) * s_hist[i][t];
+            }
+        }
+        // ensure descent: if d'g > 0, fall back to -g
+        let mut dg = 0.0f64;
+        for t in 0..p {
+            dg += d[t] * gx[t];
+        }
+        if dg >= 0.0 {
+            for t in 0..p {
+                d[t] = -gx[t];
+            }
+        }
+        // projected steepest-descent feasibility adjustment
+        for t in 0..p {
+            if (x[t] <= lo[t] && d[t] > 0.0) || (x[t] >= hi[t] && d[t] < 0.0) {
+                d[t] = 0.0;
+            }
+        }
+        // line search (backtracking Armijo on the projected step)
+        let mut alpha0 = 1.0;
+        let mut ok = false;
+        for _ls in 0..30 {
+            let mut xn = vec![0.0f64; p];
+            for t in 0..p {
+                xn[t] = clip(x[t] + alpha0 * d[t], t);
+            }
+            let fxn = f(&xn);
+            let mut gd = 0.0f64;
+            for t in 0..p {
+                gd += gx[t] * (xn[t] - x[t]);
+            }
+            if fxn <= fx + 1e-4 * alpha0 * gd {
+                ok = true;
+                break;
+            }
+            alpha0 *= 0.5;
+        }
+        if !ok {
+            break;
+        }
+        let mut xn = vec![0.0f64; p];
+        for t in 0..p {
+            xn[t] = clip(x[t] + alpha0 * d[t], t);
+        }
+        let fxn = f(&xn);
+        let gxn = g(&xn);
+        // convergence test
+        let mut step = 0.0f64;
+        for t in 0..p {
+            step += (xn[t] - x[t]) * (xn[t] - x[t]);
+        }
+        let mut gmax = 0.0f64;
+        for t in 0..p {
+            gmax = gmax.max(gx[t].abs());
+        }
+        let conv = (step.sqrt() < tol * (1.0 + x.iter().map(|v| v.abs()).sum::<f64>()))
+            && (gmax < tol * (1.0 + fx.abs()));
+        if conv {
+            x = xn;
+            fx = fxn;
+            break;
+        }
+        // update history
+        let mut s = vec![0.0f64; p];
+        let mut y = vec![0.0f64; p];
+        let mut s_norm = 0.0f64;
+        let mut y_norm = 0.0f64;
+        for t in 0..p {
+            s[t] = xn[t] - x[t];
+            y[t] = gxn[t] - gx[t];
+            s_norm += s[t] * s[t];
+            y_norm += y[t] * y[t];
+        }
+        if s_norm.sqrt() > 1e-12 && y_norm.sqrt() > 1e-12 {
+            let mut sy = 0.0f64;
+            for t in 0..p {
+                sy += s[t] * y[t];
+            }
+            s_hist.push(s);
+            y_hist.push(y);
+            rho_hist.push(1.0 / sy);
+            alpha_hist.push(0.0);
+            if s_hist.len() > m {
+                s_hist.remove(0);
+                y_hist.remove(0);
+                rho_hist.remove(0);
+                alpha_hist.remove(0);
+            }
+        }
+        x = xn;
+        fx = fxn;
+        gx = gxn;
+    }
+    (x, fx, iters)
+}
+
+/// Minimum-residual (OLS) factoring, correlation basis. Minimize the
+/// off-diagonal residual with L-BFGS-B over the uniqueness vector.
+/// Mirrors psych::fa(fm="minres"). Returns (loadings, eigenvalues of R, iters).
+fn minres_loadings(r: &[f64], p: usize, q: usize) -> Option<(Vec<f64>, Vec<f64>, usize)> {
+    let start = smc(r, p);
+    let lo: Vec<f64> = vec![0.005f64; p];
+    let hi_v = r.iter().cloned().fold(1.0f64, |a, b| a.max(b));
+    let hi: Vec<f64> = vec![hi_v.max(1.0); p];
+    let mut s0 = vec![0.0f64; p];
+    for j in 0..p {
+        s0[j] = start[j].max(0.005);
+    }
+    // capture r, p, q in the closures
+    let r_ = r.to_vec();
+    let (psi, _fx, iters) =
+        lbfgsb_b(
+            |x| minres_obj(&r_, x, p, q),
+            |x| minres_grad(&r_, x, p, q),
+            &s0,
+            &lo,
+            &hi,
+            20,
+            10000,
+            1e-10,
+        );
+    let (lam, _model) = minres_reduced(r, &psi, p, q);
+    let (w, _v) = jacobi_eig(r, p);
+    let mut order: Vec<usize> = (0..p).collect();
+    order.sort_by(|a, b| w[*b].partial_cmp(&w[*a]).unwrap_or(std::cmp::Ordering::Equal));
+    let w_desc: Vec<f64> = order.iter().map(|&i| w[i]).collect();
+    Some((lam, w_desc, iters))
+}
+
+/// Kaiser-normalized promax (JASP's default oblique rotation). From psych
+/// Promax.R + kaiser.R: W = L/sqrt(h2); varimax(W) -> (Wv, Th);
+/// U = (Wv'Wv)^-1 Wv' (Wv|Wv|^(m-1)); scale U by diag(inv U'U) sqrt; U <- Th U;
+/// Lr = Wv U * sqrt(h2); Phi = inv(U) inv(U)'. Returns (Lr, Phi).
+pub fn kaiser_promax(lam: &[f64], p: usize, q: usize, m: f64) -> Option<(Vec<f64>, Vec<f64>)> {
+    if q == 1 {
+        return Some((lam.to_vec(), vec![1.0f64]));
+    }
+    // h2_i = sum_j L_ij^2
+    let mut h2 = vec![0.0f64; p];
+    for i in 0..p {
+        for j in 0..q {
+            h2[i] += lam[i * q + j] * lam[i * q + j];
+        }
+        h2[i] = h2[i].max(1e-12);
+    }
+    // W = L / sqrt(h2)
+    let mut w = vec![0.0f64; p * q];
+    for i in 0..p {
+        let sc = h2[i].sqrt();
+        for j in 0..q {
+            w[i * q + j] = lam[i * q + j] / sc;
+        }
+    }
+    // varimax(W) -> wv  (Guttman, sign-fixed).  Derive the pre-rotation
+    // th_eff = lstsq(W, Wv) so W @ th_eff == Wv regardless of varimax's
+    // column-sign convention (robust: absorbs any sign flips in wv).
+    let (wv, _th, _it) = varimax(&w, p, q, 1e-8, 2000, 1e-12);
+    // th_eff = (W' W)^-1 (W' Wv)   -- q x q
+    let wt = trans(&w, p, q); // q x p
+    let wtw_eff = matmul(&wt, q, p, &w, q); // W' W
+    let wtq_eff = matmul(&wt, q, p, &wv, q); // W' Wv
+    let th_eff = match invert(&wtw_eff, q) {
+        Some(inv) => matmul(&inv, q, q, &wtq_eff, q),
+        None => _th, // fallback: identity-ish if singular (shouldn't happen)
+    };
+    // Q = Wv * |Wv|^(m-1)
+    let mut qm = vec![0.0f64; p * q];
+    for i in 0..p {
+        for j in 0..q {
+            qm[i * q + j] = wv[i * q + j] * wv[i * q + j].abs().powf(m - 1.0);
+        }
+    }
+    // U = (Wv' Wv)^-1 (Wv' Q)   -- solve q x q system (lstsq via normal eqs)
+    let wt = trans(&wv, p, q); // q x p
+    let wtw = matmul(&wt, q, p, &wv, q); // q x q = Wv' Wv
+    let wtq = matmul(&wt, q, p, &qm, q); // q x q = Wv' Q
+    let wtw_inv = invert(&wtw, q)?;
+    let mut u = matmul(&wtw_inv, q, q, &wtq, q); // q x q
+    // d = diag(inv(U' U));  U <- U * sqrt(d)  (row scale)
+    let ut = trans(&u, q, q); // q x q
+    let utu = matmul(&ut, q, q, &u, q); // U' U (q x q)
+    let mut d = vec![1.0f64; q];
+    if let Some(utu_inv) = invert(&utu, q) {
+        for j in 0..q {
+            d[j] = utu_inv[j * q + j].max(1e-300).sqrt();
+        }
+    }
+    for j in 0..q {
+        for i in 0..q {
+            u[i * q + j] *= d[j];
+        }
+    }
+    // Lr = Wv @ U_rescaled  (single-Th, since Wv = W @ Th).  Scaled by sqrt(h2).
+    let u_rescaled = u;
+    let mut lr = vec![0.0f64; p * q];
+    for i in 0..p {
+        let sc = h2[i].sqrt();
+        for j in 0..q {
+            let mut s = 0.0f64;
+            for k in 0..q {
+                s += wv[i * q + k] * u_rescaled[k * q + j];
+            }
+            lr[i * q + j] = s * sc;
+        }
+    }
+    // sign-fix each column of Lr (largest |loading| positive)
+    for j in 0..q {
+        let mut bi = 0;
+        let mut bv = f64::NEG_INFINITY;
+        for i in 0..p {
+            let a = lr[i * q + j].abs();
+            if a > bv {
+                bv = a;
+                bi = i;
+            }
+        }
+        if lr[bi * q + j] < 0.0 {
+            for i in 0..p {
+                lr[i * q + j] *= -1.0;
+            }
+        }
+    }
+    // U_final = th_eff @ U_rescaled  (the full promax rotation matrix)
+    let u_final = matmul(&th_eff, q, q, &u_rescaled, q);
+    // Phi = inv(U_final) @ inv(U_final)'
+    let phi = {
+        let ui = invert(&u_final, q)?; // q x q
+        let uit = trans(&ui, q, q);
+        matmul(&ui, q, q, &uit, q)
+    };
+    Some((lr, phi))
+}
+
 /// Guttman fixed-point varimax on loadings L (p x q). Returns rotated
 /// loadings + iteration count. Verified against scipy (test/oracle_efa.py).
-fn varimax(lam: &[f64], p: usize, q: usize, delta: f64, max_iter: usize, tol: f64) -> (Vec<f64>, usize) {
+fn varimax(lam: &[f64], p: usize, q: usize, delta: f64, max_iter: usize, tol: f64) -> (Vec<f64>, Vec<f64>, usize) {
     if q < 2 {
-        return (lam.to_vec(), 0);
+        let mut ti = vec![0.0f64; q * q];
+        for j in 0..q {
+            ti[j * q + j] = 1.0;
+        }
+        return (lam.to_vec(), ti, 0);
     }
     let mut t = vec![0.0f64; q * q];
     for j in 0..q {
@@ -200,24 +575,23 @@ fn varimax(lam: &[f64], p: usize, q: usize, delta: f64, max_iter: usize, tol: f6
                 tn[j * q + i] = m;
             }
         }
-        // orthogonalize Tn: Tn (Tn' Tn)^{-1/2} via Jacobi
+        // orthogonalize Tn: nearest orthogonal matrix.  Tn is symmetric,
+        // so its polar (orthogonal) factor is V diag(sign(w)) V' (the
+        // Jacobi eigenvectors V with eigenvalues w).
         let (w, v) = jacobi_eig(&tn, q);
-        let mut t_new = vec![0.0f64; q * q];
+        // sign_j = sign(w_j)
+        let mut sign = vec![1.0f64; q];
         for j in 0..q {
-            let wj = w[j].max(1e-300).sqrt();
-            for i in 0..q {
-                t_new[i * q + j] = v[i * q + j] / wj;
-            }
+            sign[j] = if w[j] < 0.0 { -1.0 } else { 1.0 };
         }
-        // t_new = Tn @ diag(1/sqrt(w))
+        // t_orth = (V diag(sign)) V'
         let mut t_orth = vec![0.0f64; q * q];
         for i in 0..q {
             for j in 0..q {
-                let mut s = 0.0f64;
+                let mij = v[i * q + j] * sign[j];
                 for k in 0..q {
-                    s += tn[i * q + k] * t_new[k * q + j];
+                    t_orth[i * q + k] += mij * v[k * q + j];
                 }
-                t_orth[i * q + j] = s;
             }
         }
         // sign-fix columns of T
@@ -271,7 +645,16 @@ fn varimax(lam: &[f64], p: usize, q: usize, delta: f64, max_iter: usize, tol: f6
             }
         }
     }
-    (lrot, iters)
+    (lrot, t, iters)
+}
+
+/// Identity factor-correlation matrix (orthogonal rotations).
+fn identity_phi(q: usize) -> Vec<f64> {
+    let mut phi = vec![0.0f64; q * q];
+    for j in 0..q {
+        phi[j * q + j] = 1.0;
+    }
+    phi
 }
 
 /// SRMR over the upper triangle (incl. diagonal) of (L L' + diag(uni) - R).
@@ -305,12 +688,15 @@ pub fn efa_fit(
     }
     let cov = sample_cov_full(data, n, p);
     let r = cov2cor(&cov, p)?;
-    let (lam, w_desc) = match method {
-        "pca" => pca_loadings(&r, p, q),
-        "pa" => {
-            let (l, w, _) = pa_loadings(&r, p, q, 10000, 1e-12)?;
-            (l, w)
-        }
+    // Eigenvalues of the correlation matrix (reported for all methods).
+    let (w_r, _v_r) = jacobi_eig(&r, p);
+    let mut order_r: Vec<usize> = (0..p).collect();
+    order_r.sort_by(|a, b| w_r[*b].partial_cmp(&w_r[*a]).unwrap_or(std::cmp::Ordering::Equal));
+    let w_desc: Vec<f64> = order_r.iter().map(|&i| w_r[i]).collect();
+    let lam = match method {
+        "pca" => pca_loadings(&r, p, q).0,
+        "pa" => pa_loadings(&r, p, q, 10000, 1e-12)?.0,
+        "minres" => minres_loadings(&r, p, q)?.0,
         _ => return None,
     };
     // communality / uniquenesses
@@ -323,10 +709,17 @@ pub fn efa_fit(
         h[i] = s;
     }
     let uni: Vec<f64> = h.iter().map(|v| (1.0 - v).max(0.0)).collect();
-    // rotate
-    let (lam_rot, rot_iters) = match rotate {
-        "none" => (lam.clone(), 0),
-        "varimax" => varimax(&lam, p, q, 1e-8, 2000, 1e-12),
+    // rotate: none / varimax (orthogonal, Phi=I) or promax (oblique, Phi)
+    let (lam_rot, phi, rot_iters) = match rotate {
+        "none" => (lam.clone(), identity_phi(q), 0),
+        "varimax" => {
+            let (lrot, _th, it) = varimax(&lam, p, q, 1e-8, 2000, 1e-12);
+            (lrot, identity_phi(q), it)
+        }
+        "promax" => {
+            let (lrot, phi) = kaiser_promax(&lam, p, q, 4.0)?;
+            (lrot, phi, 1)
+        }
         _ => return None,
     };
     // proportion of variance
@@ -351,6 +744,7 @@ pub fn efa_fit(
         lambda_rot: lam_rot,
         uniquenesses: uni,
         communality: h,
+        phi: phi,
         srml: srm,
         rotate_iters: rot_iters,
     })

@@ -1,4 +1,4 @@
 name: factor_sem_ext
-version: 0.2.0
+version: 0.2.1
 language: Rust
-description: Confirmatory + Exploratory Factor Analysis (CFA via FIML/ML, EFA via PCA/PA + varimax) — JASP Factor core
+description: Confirmatory + Exploratory Factor Analysis (CFA via FIML/ML, EFA via PCA/PA/minres + varimax/promax) — JASP Factor core

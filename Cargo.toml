@@ -1,6 +1,6 @@
 [package]
 name = "duckdb_factor_sem"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 description = "DuckDB extension: Confirmatory + Exploratory Factor Analysis (CFA via FIML/ML, EFA via PCA/PA + varimax) — JASP Factor core"
 license = "MIT"

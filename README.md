@@ -13,9 +13,11 @@ Two estimators:
   (χ², df, AIC, BIC, RMSEA, CFI, TLI, log-likelihood).
 - **EFA** — exploratory factor analysis on the **correlation** matrix,
   **no pre-specified structure** (all p×q loadings free). Factoring by
-  **PCA** or **principal-axis (Thurstone)**, optionally **varimax**-rotated.
-  Returns (rotated) loadings, uniquenesses, communality, eigenvalues,
-  proportion of variance, and SRMR.
+  **PCA**, **principal-axis (Thurstone)**, or **minres / OLS** (JASP's
+  default); rotated by **varimax** (orthogonal) or **promax** (oblique,
+  Kaiser-normalized — JASP's default oblique).
+  Returns (rotated) loadings, factor correlations `Φ`, uniquenesses,
+  communality, eigenvalues, proportion of variance, and SRMR.
 
 This is the 6th (final) extension of the JASP-module → DuckDB series:
 `read_jasp` · `bayes` · `meta` · `irt` · `spc` · **`factor_sem`**.
@@ -29,7 +31,7 @@ this machine; a Windows host yields a `.dll`). Offline cargo:
 export CARGO_NET_OFFLINE=true
 mkdir -p configure
 echo "linux_amd64"  > configure/platform.txt
-echo "v0.2.0"       > configure/extension_version.txt
+echo "v0.2.1"       > configure/extension_version.txt
 DUCKDB_EXTENSION_NAME=factor_sem_ext \
 DUCKDB_EXTENSION_MIN_DUCKDB_VERSION=v1.2.0 \
   cargo build --offline --release
@@ -65,9 +67,11 @@ symmetric covariance `S`.
 ### `efa(data VARCHAR, factors VARCHAR, method VARCHAR, rotate VARCHAR) -> VARCHAR`
 
 **Exploratory factor analysis** on raw data. `data` / `factors` as above;
-`method` is `'pca'` or `'pa'` (principal-axis); `rotate` is `'none'` or
-`'varimax'`. The correlation matrix is computed from `data`; loadings are
-estimated, optionally varimax-rotated, and sign-fixed so each factor column's
+`method` is `'pca'`, `'pa'` (principal-axis), or `'minres'` (minimum
+residual / OLS — JASP's default); `rotate` is `'none'`, `'varimax'`
+(orthogonal), or `'promax'` (oblique, Kaiser-normalized — JASP's default
+oblique). The correlation matrix is computed from `data`; loadings are
+estimated, optionally rotated, and sign-fixed so each factor column's
 largest-|loading| is positive (deterministic).
 
 ### JSON output
@@ -94,6 +98,7 @@ EFA:
   "proportion_var": [0.33, 0.24, ...],                // eigenvalue / sum
   "lambda": [[...], ...],                             // p x q unrotated loadings
   "lambda_rot": [[...], ...],                         // p x q rotated loadings (sign-fixed)
+  "phi": [[1,0],[0,1]],                               // q x q factor correlation (I for orthogonal)
   "uniquenesses": [0.45, ...],                        // p  (1 - communality)
   "communality": [0.55, ...],                         // p  (sum of squared loadings)
   "srml": 0.05,                                       // SRMR over upper triangle
@@ -122,10 +127,22 @@ The M-step is the FIML covariance EM: with `Σ = ΛΛᵀ + Ψ`,
 **EFA.** On the sample **correlation** matrix `R`. `pca` takes the top-q
 eigenvectors scaled by `√eigenvalue`; `pa` (principal-axis, Thurstone)
 iterates the uniqueness diagonal to a fixed point (`R_r = R − diag(1−h)`).
+`minres` (minimum residual / OLS, JASP's default) optimizes the uniqueness
+diagonal `ψ` to minimize the **strictly-lower-triangular** squared OLS
+residuals `Σ_{i>j}(Rᵢⱼ − LᵢLⱼᵀ)²`, by **two-loop L-BFGS-B** (box
+`[0.005, 0.99]`) with the analytic gradient — the same solver R's
+`optim(..., method="L-BFGS-B")` uses; verified to a 1e-9 objective match
+against scipy L-BFGS-B plus an independent finite-difference gradient
+check.
 **Varimax** rotation (Kaiser/Guttman orthogonal criterion) is a fixed-point
 iteration `Lᵀ = (L⊙(LᵀL)) (LᵀL)⁻¹` that increases `Σ_j (Σ_i lᵢⱼ²)²`,
-converged when the change drops below `1e-8`, then sign-fixed. Both are
-verified against an independent numpy oracle (`test/oracle_efa.py`).
+converged when the change drops below `1e-8`, then sign-fixed.
+**Promax** (Kaiser-normalized, oblique — JASP's default oblique) is
+`kaiser(loadings, rotate="Promax")`: scale columns to unit norm, varimax the
+scaled matrix, regress `W⊙|W|³` on `W` for the oblique rotation `U`, then
+`Φ = U⁻¹(U⁻¹)ᵀ`.
+All EFA methods/rotations are verified against an independent numpy oracle
+(`test/oracle_efa.py`).
 
 The cyclic **Jacobi** eigen-decomposition in `src/math.rs` was rewritten to
 the correct Givens form (`A ← GᵀAG`, `V ← VG`, Numerical-Recipes angle
@@ -135,20 +152,21 @@ original had a wrong angle approximation that produced incorrect eigenvalues
 (hidden in CFA, where eigenvalues only seed EM initialization and are masked
 by multi-start; exposed once EFA started emitting eigenvalues directly).
 
-## v0.2.0 scope
+## v0.2.1 scope
 
 - **CFA** (unchanged): uncorrelated standard factors (Φ = I), arbitrary
   `q < p`, ML estimation, all fit indices. `q = 1` numerically exact against
   the scipy oracle; `q ≥ 2` best-effort (local-maxima sensitivity).
-- **EFA** (new): correlation-basis, manual factor count, **PCA** or
-  **principal-axis** factoring, **varimax** (orthogonal) or no rotation.
-  Output: rotated loadings, uniquenesses, communality, eigenvalues,
-  proportion of variance, SRMR.
+- **EFA** (extended in v0.2.1): correlation-basis, manual factor count,
+  **PCA / principal-axis / minres (OLS)** factoring, **varimax (orthogonal)
+  or promax (oblique)** or no rotation. Output: rotated loadings, factor
+  correlations `Φ`, uniquenesses, communality, eigenvalues, proportion of
+  variance, SRMR. `minres` + `promax` are JASP's defaults.
 
-**Not yet** (roadmap → v0.2.1+):
-- EFA: **minres / WLS / ML** factoring (JASP's default is minres), **quartimax /
-  promax / oblimin** (oblique) rotation, **parallel analysis / eigenvalue**
-  factor-count rules, **polychoric / tetrachoric** input.
+**Not yet** (roadmap → v0.2.2+):
+- EFA: **quartimax / oblimin** (oblique) rotation, **WLS / ML** factoring,
+  **parallel analysis / eigenvalue** factor-count rules, **polychoric /
+  tetrachoric** input.
 - **Full SEM** (path model, exogenous / endogenous predictors, correlated
   factors, covariates)
 - **Measurement invariance / multiple-group CFA**
@@ -163,15 +181,19 @@ by multi-start; exposed once EFA started emitting eigenvalues directly).
 - **Unit** (`cargo test --lib`): 6 tests. `single_factor_recovers_loadings`
   and `over_identified_two_factor_matches_oracle` verify the CFA FIML EM
   against the scipy L-BFGS-B oracle. `efa_pca_varimax_matches_oracle` runs all
-  5 EFA cases (pca/pa × varimax/none, q=1/2/3) and checks eigenvalues,
-  rotated loadings (sign-normalized), uniquenesses, and SRMR against the
-  numpy oracle within `1e-3`.
-- **e2e** (`bash test/run_factor.sh`): 39 self-checks against the built
+  8 EFA cases (pca/pa/minres × varimax/promax/none) and checks eigenvalues,
+  rotated loadings (sign-normalized), uniquenesses, `Φ`, and SRMR against the
+  numpy oracle (orthogonal cases `1e-3`; minres/oblique cases looser, since
+  the OLS-uniquenesses surface is flat and the oblique rotation amplifies the
+  1e-6 solver-solution difference).
+- **e2e** (`bash test/run_factor.sh`): 50 self-checks against the built
   `.duckdb_extension` in the real DuckDB CLI (`-unsigned`). Part 1 fits the
   oracle covariance via `cfa_cov`; Part 2 smoke-tests `cfa_fit` on raw data;
-  Part 3 runs `efa` (pca+varimax p=6 q=2 and pa+none p=4 q=1) on fixed
-  datasets and checks eigenvalues / SRMR / rotated loadings against the numpy
-  oracle. Also covers the NULL error paths (bad method / rotation).
+  Part 3 runs `efa` on fixed datasets — pca+varimax (p=6 q=2), pa+none (p=4
+  q=1), **minres+varimax (p=6 q=2)**, and **minres+promax (p=8 q=2, oblique:
+  checks `Φ` ≠ I)** — checking eigenvalues / SRMR / rotated loadings / `Φ`
+  against the numpy oracle. Also covers the NULL error paths (bad method /
+  rotation).
 
 Regenerate references: `python test/oracle_factor.py` → `test/factor_ref.json`,
 `python test/oracle_efa.py` → `test/efa_ref.json`, then
@@ -182,13 +204,17 @@ Regenerate references: `python test/oracle_factor.py` → `test/factor_ref.json`
 - `src/math.rs` — pure Rust stats core: Jacobi eigen-decomp (Givens form),
   Cholesky logdet, Gauss-Jordan inverse, FIML covariance EM + multi-start,
   fit indices. No external deps beyond `libm`.
-- `src/efa.rs` — EFA core: sample covariance → correlation, PCA / PA loadings,
-  Guttman varimax, SRMR.
+- `src/efa.rs` — EFA core: sample covariance → correlation, PCA / PA / minres
+  (two-loop L-BFGS-B) loadings, Guttman varimax, Kaiser-normalized promax,
+  factor correlation `Φ`, SRMR.
 - `src/lib.rs` — DuckDB C-API glue (quack-rs): `cfa_fit`, `cfa_cov`, `efa`,
   JSON builders, unit tests.
 - `test/oracle_factor.py` — scipy/numpy CFA oracle → `test/factor_ref.json`.
-- `test/oracle_efa.py` — numpy EFA oracle (PCA/PA + varimax) →
+- `test/oracle_efa.py` — numpy EFA oracle (PCA/PA/minres + varimax/promax,
+  minres cross-checked by analytic vs finite-difference L-BFGS-B) →
   `test/efa_ref.json`.
+- `test/ref_{Promax,kaiser,smc,factor.minres}.R` — psych / JASP reference
+  algorithms (provenance for the minres + promax ports).
 - `test/gen_raw.py` — reproducible raw dataset for the CFA e2e smoke test.
 - `test/gen_e2e_factor.py` — emits `test/test_factor.sql` (CFA + EFA).
 - `test/run_factor.sh` — e2e runner (builds if needed, asserts `n_fail = 0`).
