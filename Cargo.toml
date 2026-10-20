@@ -1,0 +1,23 @@
+[package]
+name = "duckdb_factor_sem"
+version = "0.1.0"
+edition = "2021"
+description = "DuckDB extension: Confirmatory Factor Analysis (CFA) via FIML/ML — JASP Factor core"
+license = "MIT"
+repository = "https://github.com/alitrack/duckdb_factor_sem"
+
+[lib]
+name = "factor_sem_ext"
+crate-type = ["cdylib", "rlib"]
+
+[profile.release]
+lto = true
+strip = true
+
+[dependencies]
+quack-rs = "0.14"
+libduckdb-sys = "1.10504"
+libm = "0.2"
+
+[dev-dependencies]
+serde_json = "1"

@@ -1,0 +1,4 @@
+name: factor_sem_ext
+version: 0.1.0
+language: Rust
+description: Confirmatory Factor Analysis (CFA) via FIML/ML — JASP Factor core
