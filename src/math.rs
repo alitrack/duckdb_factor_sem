@@ -179,7 +179,7 @@ pub struct CfaResult {
 
 /// Jacobi eigen-decomposition for symmetric p x p; returns
 /// (eigenvalues, eigenvectors-as-columns), both full.
-fn jacobi_eig(a: &[f64], p: usize) -> (Vec<f64>, Vec<f64>) {
+pub fn jacobi_eig(a: &[f64], p: usize) -> (Vec<f64>, Vec<f64>) {
     let mut d = vec![0.0f64; p * p];
     for i in 0..p {
         for j in 0..p {
@@ -190,6 +190,13 @@ fn jacobi_eig(a: &[f64], p: usize) -> (Vec<f64>, Vec<f64>) {
     for i in 0..p {
         v[i * p + i] = 1.0;
     }
+    // Cyclic Jacobi. Each (i,j) rotation builds the Givens G with
+    // G[i][i]=G[j][j]=c, G[i][j]=s, G[j][i]=-s, then applies A = G^T A G
+    // and V = V G. Element updates verified against numpy.linalg.eigh
+    // (eigenvalues and eigenvectors to ~1e-15). The angle uses the
+    // Numerical-Recipes formula t = sign(tau) / (|tau| + sqrt(1+tau^2)),
+    // tau = (d_jj - d_ii) / (2 d_ij) — NOT the (d_ij/(|th|+|d_ij|)) form,
+    // which is an incorrect approximation that yields wrong eigenvalues.
     for _sweep in 0..60 {
         let mut off = 0.0f64;
         for i in 0..p {
@@ -202,33 +209,39 @@ fn jacobi_eig(a: &[f64], p: usize) -> (Vec<f64>, Vec<f64>) {
         }
         for i in 0..p {
             for j in (i + 1)..p {
-                if d[i * p + j].abs() < 1e-16 {
+                let dij = d[i * p + j];
+                if dij.abs() < 1e-16 {
                     continue;
                 }
-                let th = 0.5 * d[i * p + i] - 0.5 * d[j * p + j];
-                let t = d[i * p + j] / (th.abs() + d[i * p + j].abs());
+                let tau = (d[j * p + j] - d[i * p + i]) / (2.0 * dij);
+                let denom = tau.abs() + (1.0 + tau * tau).sqrt();
+                let t = if tau >= 0.0 {
+                    1.0 / denom
+                } else {
+                    -1.0 / denom
+                };
                 let c = 1.0 / (1.0 + t * t).sqrt();
                 let s = c * t;
-                let d_ii = d[i * p + i];
-                let d_jj = d[j * p + j];
-                d[i * p + i] = d_ii - t * d[i * p + j];
-                d[j * p + j] = d_jj + t * d[i * p + j];
-                d[i * p + j] = 0.0;
-                d[j * p + i] = 0.0;
+                // B = A G : update columns i and j of d for every row k.
                 for k in 0..p {
-                    if k != i && k != j {
-                        let tmp = d[k * p + i] * c + d[k * p + j] * s;
-                        d[k * p + j] = -d[k * p + i] * s + d[k * p + j] * c;
-                        d[k * p + i] = tmp;
-                        d[i * p + k] = d[k * p + i];
-                        d[j * p + k] = d[k * p + j];
-                    }
+                    let a_ki = d[k * p + i];
+                    let a_kj = d[k * p + j];
+                    d[k * p + i] = c * a_ki - s * a_kj;
+                    d[k * p + j] = s * a_ki + c * a_kj;
                 }
+                // d = G^T B : update rows i and j for every column n.
+                for n in 0..p {
+                    let b_i_n = d[i * p + n];
+                    let b_j_n = d[j * p + n];
+                    d[i * p + n] = c * b_i_n - s * b_j_n;
+                    d[j * p + n] = s * b_i_n + c * b_j_n;
+                }
+                // V = V G : update columns i and j of v for every row k.
                 for k in 0..p {
-                    let vk_i = v[k * p + i];
-                    let vk_j = v[k * p + j];
-                    v[k * p + i] = vk_i * c - vk_j * s;
-                    v[k * p + j] = vk_i * s + vk_j * c;
+                    let v_ki = v[k * p + i];
+                    let v_kj = v[k * p + j];
+                    v[k * p + i] = c * v_ki - s * v_kj;
+                    v[k * p + j] = s * v_ki + c * v_kj;
                 }
             }
         }
@@ -472,7 +485,7 @@ pub fn cfa_cov_fit(s: &[f64], p: usize, q: usize, n: usize, max_iter: usize, tol
 
 // ─── fit indices ────────────────────────────────────────────────────────
 
-fn trans(a: &[f64], m: usize, n: usize) -> Vec<f64> {
+pub fn trans(a: &[f64], m: usize, n: usize) -> Vec<f64> {
     let mut t = vec![0.0f64; m * n];
     for i in 0..n {
         for j in 0..m {

@@ -1,12 +1,21 @@
 # duckdb_factor_sem
 
-Confirmatory Factor Analysis (CFA) in DuckDB SQL — the core of JASP's *Factor*
-module, packaged as a standalone DuckDB C-API extension (Rust + quack-rs).
+Confirmatory **and** Exploratory Factor Analysis in DuckDB SQL — the core of
+JASP's *Factor* module, packaged as a standalone DuckDB C-API extension
+(Rust + quack-rs).
 
-Fit a factor model `X = Λ f + e` (f ~ N(0, I_q), e ~ N(0, diag(Ψ))) by
-**maximum likelihood** (FIML formulation) via **covariance EM with
-multi-start**, and get loadings, uniquenesses, and the full suite of fit
-indices (χ², df, AIC, BIC, RMSEA, CFI, TLI, log-likelihood).
+Two estimators:
+
+- **CFA** — confirmatory factor analysis, `X = Λ f + e` (f ~ N(0, I_q),
+  e ~ N(0, diag(Ψ))) with a **pre-specified** loading pattern, fit by
+  **maximum likelihood** (FIML) via **covariance EM with multi-start**.
+  Returns loadings, uniquenesses, and the full fit-index suite
+  (χ², df, AIC, BIC, RMSEA, CFI, TLI, log-likelihood).
+- **EFA** — exploratory factor analysis on the **correlation** matrix,
+  **no pre-specified structure** (all p×q loadings free). Factoring by
+  **PCA** or **principal-axis (Thurstone)**, optionally **varimax**-rotated.
+  Returns (rotated) loadings, uniquenesses, communality, eigenvalues,
+  proportion of variance, and SRMR.
 
 This is the 6th (final) extension of the JASP-module → DuckDB series:
 `read_jasp` · `bayes` · `meta` · `irt` · `spc` · **`factor_sem`**.
@@ -20,7 +29,7 @@ this machine; a Windows host yields a `.dll`). Offline cargo:
 export CARGO_NET_OFFLINE=true
 mkdir -p configure
 echo "linux_amd64"  > configure/platform.txt
-echo "v0.1.0"       > configure/extension_version.txt
+echo "v0.2.0"       > configure/extension_version.txt
 DUCKDB_EXTENSION_NAME=factor_sem_ext \
 DUCKDB_EXTENSION_MIN_DUCKDB_VERSION=v1.2.0 \
   cargo build --offline --release
@@ -53,8 +62,17 @@ verify against the oracle). `cov` is `'n p s00 s01 ... s(p-1)(p-1)'` — `n`
 the effective sample size, then the upper triangle (row-major) of the
 symmetric covariance `S`.
 
+### `efa(data VARCHAR, factors VARCHAR, method VARCHAR, rotate VARCHAR) -> VARCHAR`
+
+**Exploratory factor analysis** on raw data. `data` / `factors` as above;
+`method` is `'pca'` or `'pa'` (principal-axis); `rotate` is `'none'` or
+`'varimax'`. The correlation matrix is computed from `data`; loadings are
+estimated, optionally varimax-rotated, and sign-fixed so each factor column's
+largest-|loading| is positive (deterministic).
+
 ### JSON output
 
+CFA:
 ```json
 {
   "p": 4, "q": 1, "n": 400, "df": 3,
@@ -67,14 +85,32 @@ symmetric covariance `S`.
 }
 ```
 
-Loadings are **identified up to sign** (the ML solution is invariant to
-`f → −f`); comparisons use `|λ|`.
+EFA:
+```json
+{
+  "meta": {"p": 6, "q": 2, "n": 40},
+  "method": "pca", "rotate": "varimax",
+  "eigenvalues": [2.75, 1.98, 0.55, ...],             // all p, descending
+  "proportion_var": [0.33, 0.24, ...],                // eigenvalue / sum
+  "lambda": [[...], ...],                             // p x q unrotated loadings
+  "lambda_rot": [[...], ...],                         // p x q rotated loadings (sign-fixed)
+  "uniquenesses": [0.45, ...],                        // p  (1 - communality)
+  "communality": [0.55, ...],                         // p  (sum of squared loadings)
+  "srml": 0.05,                                       // SRMR over upper triangle
+  "rotate_iters": 1
+}
+```
+
+CFA loadings are **identified up to sign** (the ML solution is invariant to
+`f → −f`); comparisons use `|λ|`. EFA rotated loadings are sign-fixed by the
+varimax sign rule, so they compare directly; unrotated ("none") loadings are
+sign-arbitrary per factor column.
 
 ## Method
 
-Maximum-likelihood factor analysis is **non-concave** — it has many local
-maxima, so the optimizer's result depends on the starting point. We address
-this the standard way: **multi-start** EM (9 starts — PCA-largest,
+**CFA.** Maximum-likelihood factor analysis is **non-concave** — it has many
+local maxima, so the optimizer's result depends on the starting point. We
+address this the standard way: **multi-start** EM (9 starts — PCA-largest,
 PCA-smallest, diagonal, and 6 deterministic pseudo-random loadings — keep the
 highest-likelihood solution).
 
@@ -83,18 +119,38 @@ The M-step is the FIML covariance EM: with `Σ = ΛΛᵀ + Ψ`,
 `src/math.rs`). Verified against an independent **scipy L-BFGS-B** reference
 (`test/oracle_factor.py`) and a pure-numpy covariance-EM cross-check.
 
-## v0.1.0 scope
+**EFA.** On the sample **correlation** matrix `R`. `pca` takes the top-q
+eigenvectors scaled by `√eigenvalue`; `pa` (principal-axis, Thurstone)
+iterates the uniqueness diagonal to a fixed point (`R_r = R − diag(1−h)`).
+**Varimax** rotation (Kaiser/Guttman orthogonal criterion) is a fixed-point
+iteration `Lᵀ = (L⊙(LᵀL)) (LᵀL)⁻¹` that increases `Σ_j (Σ_i lᵢⱼ²)²`,
+converged when the change drops below `1e-8`, then sign-fixed. Both are
+verified against an independent numpy oracle (`test/oracle_efa.py`).
 
-Closed, verifiable slice: **CFA with uncorrelated standard factors (Φ = I)**,
-arbitrary `q < p`, ML estimation, all fit indices. `q = 1` is verified
-numerically exact against the scipy oracle; `q ≥ 2` is best-effort
-(local-maxima sensitivity — the multi-start mitigates but does not
-eliminate it; ML multi-factor is a known-hard global optimization).
+The cyclic **Jacobi** eigen-decomposition in `src/math.rs` was rewritten to
+the correct Givens form (`A ← GᵀAG`, `V ← VG`, Numerical-Recipes angle
+`t = sign(τ)/(|τ|+√(1+τ²))`, `τ = (a_jj−a_ii)/(2 a_ij)`) and re-verified
+against `numpy.linalg.eigh` (eigenvalues and eigenvectors to ~1e-15). The
+original had a wrong angle approximation that produced incorrect eigenvalues
+(hidden in CFA, where eigenvalues only seed EM initialization and are masked
+by multi-start; exposed once EFA started emitting eigenvalues directly).
 
-**Not in v0.1.0** (roadmap):
-- **EFA** (exploratory, promax/oblimin rotation, marker / geominic)
-- **Full SEM** (path model, exogenous / endogenous predictors,
-  correlated factors, covariates)
+## v0.2.0 scope
+
+- **CFA** (unchanged): uncorrelated standard factors (Φ = I), arbitrary
+  `q < p`, ML estimation, all fit indices. `q = 1` numerically exact against
+  the scipy oracle; `q ≥ 2` best-effort (local-maxima sensitivity).
+- **EFA** (new): correlation-basis, manual factor count, **PCA** or
+  **principal-axis** factoring, **varimax** (orthogonal) or no rotation.
+  Output: rotated loadings, uniquenesses, communality, eigenvalues,
+  proportion of variance, SRMR.
+
+**Not yet** (roadmap → v0.2.1+):
+- EFA: **minres / WLS / ML** factoring (JASP's default is minres), **quartimax /
+  promax / oblimin** (oblique) rotation, **parallel analysis / eigenvalue**
+  factor-count rules, **polychoric / tetrachoric** input.
+- **Full SEM** (path model, exogenous / endogenous predictors, correlated
+  factors, covariates)
 - **Measurement invariance / multiple-group CFA**
 - **Mediation / moderated mediation** (indirect effects, bootstrap CIs)
 - **PLS-SEM** (partial-least-squares path modeling)
@@ -104,27 +160,35 @@ eliminate it; ML multi-factor is a known-hard global optimization).
 
 ## Tests
 
-- **Unit** (`cargo test --lib`): 5 tests. `single_factor_recovers_loadings`
-  and `over_identified_two_factor_matches_oracle` verify the FIML EM against
-  the scipy L-BFGS-B oracle (LL / λ / χ² within tolerance).
-- **e2e** (`bash test/run_factor.sh`): 27 self-checks against the built
+- **Unit** (`cargo test --lib`): 6 tests. `single_factor_recovers_loadings`
+  and `over_identified_two_factor_matches_oracle` verify the CFA FIML EM
+  against the scipy L-BFGS-B oracle. `efa_pca_varimax_matches_oracle` runs all
+  5 EFA cases (pca/pa × varimax/none, q=1/2/3) and checks eigenvalues,
+  rotated loadings (sign-normalized), uniquenesses, and SRMR against the
+  numpy oracle within `1e-3`.
+- **e2e** (`bash test/run_factor.sh`): 39 self-checks against the built
   `.duckdb_extension` in the real DuckDB CLI (`-unsigned`). Part 1 fits the
-  oracle covariance via `cfa_cov` and compares `|λ|`, Ψ, χ², CFI, TLI, RMSEA,
-  LL to the scipy reference (verifies the binary + C-API glue + JSON + cov
-  parse). Part 2 smoke-tests `cfa_fit` on raw data and the NULL error paths.
+  oracle covariance via `cfa_cov`; Part 2 smoke-tests `cfa_fit` on raw data;
+  Part 3 runs `efa` (pca+varimax p=6 q=2 and pa+none p=4 q=1) on fixed
+  datasets and checks eigenvalues / SRMR / rotated loadings against the numpy
+  oracle. Also covers the NULL error paths (bad method / rotation).
 
-Regenerate e2e references if you change the model:
-`python test/oracle_factor.py` (→ `test/factor_ref.json`) then
-`python test/gen_e2e_sql.py` (→ `test/test_factor.sql`).
+Regenerate references: `python test/oracle_factor.py` → `test/factor_ref.json`,
+`python test/oracle_efa.py` → `test/efa_ref.json`, then
+`python test/gen_e2e_factor.py` → `test/test_factor.sql`.
 
 ## Files
 
-- `src/math.rs` — pure Rust stats core: Jacobi eigen-decomp, Cholesky
-  logdet, Gauss-Jordan inverse, FIML covariance EM + multi-start, fit
-  indices. No external deps beyond `libm`.
-- `src/lib.rs` — DuckDB C-API glue (quack-rs): `cfa_fit`, `cfa_cov`, JSON
-  builder, unit tests.
-- `test/oracle_factor.py` — scipy/numpy oracle → `test/factor_ref.json`.
-- `test/gen_raw.py` — reproducible raw dataset for the e2e smoke test.
-- `test/gen_e2e_sql.py` — emits `test/test_factor.sql` from the reference.
+- `src/math.rs` — pure Rust stats core: Jacobi eigen-decomp (Givens form),
+  Cholesky logdet, Gauss-Jordan inverse, FIML covariance EM + multi-start,
+  fit indices. No external deps beyond `libm`.
+- `src/efa.rs` — EFA core: sample covariance → correlation, PCA / PA loadings,
+  Guttman varimax, SRMR.
+- `src/lib.rs` — DuckDB C-API glue (quack-rs): `cfa_fit`, `cfa_cov`, `efa`,
+  JSON builders, unit tests.
+- `test/oracle_factor.py` — scipy/numpy CFA oracle → `test/factor_ref.json`.
+- `test/oracle_efa.py` — numpy EFA oracle (PCA/PA + varimax) →
+  `test/efa_ref.json`.
+- `test/gen_raw.py` — reproducible raw dataset for the CFA e2e smoke test.
+- `test/gen_e2e_factor.py` — emits `test/test_factor.sql` (CFA + EFA).
 - `test/run_factor.sh` — e2e runner (builds if needed, asserts `n_fail = 0`).

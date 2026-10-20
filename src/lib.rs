@@ -25,7 +25,9 @@ use libduckdb_sys::{
 };
 
 mod math;
+mod efa;
 use math::{cfa_cov_fit, cfa_fit, sample_cov};
+use efa::efa_fit;
 
 /// Parse the factors count; empty/blank -> 1.
 fn parse_q(s: &str) -> Option<usize> {
@@ -86,6 +88,38 @@ unsafe extern "C" fn cfa_cov_fn(
     }
 }
 
+unsafe extern "C" fn efa_fn(
+    _info: libduckdb_sys::duckdb_function_info,
+    input: duckdb_data_chunk,
+    output: duckdb_vector,
+) {
+    let n = usize::try_from(unsafe { duckdb_data_chunk_get_size(input) }).unwrap_or(0);
+    let rx = unsafe { VectorReader::new(input, 0) }; // data VARCHAR
+    let rq = unsafe { VectorReader::new(input, 1) }; // factors VARCHAR
+    let rm = unsafe { VectorReader::new(input, 2) }; // method VARCHAR
+    let rr = unsafe { VectorReader::new(input, 3) }; // rotate VARCHAR
+    let mut out = unsafe { VectorWriter::new(output) };
+    for i in 0..n {
+        if !unsafe { rx.is_valid(i) }
+            || !unsafe { rq.is_valid(i) }
+            || !unsafe { rm.is_valid(i) }
+            || !unsafe { rr.is_valid(i) }
+        {
+            unsafe { out.set_null(i) };
+            continue;
+        }
+        let data_s = unsafe { rx.read_str(i) };
+        let q_s = unsafe { rq.read_str(i) };
+        let m_s = unsafe { rm.read_str(i) };
+        let rot_s = unsafe { rr.read_str(i) };
+        if let Ok(j) = efa_str(data_s, q_s, m_s, rot_s) {
+            unsafe { out.write_str(i, &j) };
+        } else {
+            unsafe { out.set_null(i) };
+        }
+    }
+}
+
 fn register_all(reg: &impl Registrar) -> Result<(), ExtensionError> {
     unsafe {
         reg.register_scalar(
@@ -101,6 +135,15 @@ fn register_all(reg: &impl Registrar) -> Result<(), ExtensionError> {
                 .param(TypeId::Varchar)
                 .returns(TypeId::Varchar)
                 .function(cfa_cov_fn),
+        )?;
+        reg.register_scalar(
+            ScalarFunctionBuilder::new("efa")
+                .param(TypeId::Varchar) // data
+                .param(TypeId::Varchar) // factors
+                .param(TypeId::Varchar) // method: pca|pa
+                .param(TypeId::Varchar) // rotate: none|varimax
+                .returns(TypeId::Varchar)
+                .function(efa_fn),
         )?;
     }
     Ok(())
@@ -229,6 +272,72 @@ fn cfa_cov_str(cov_s: &str, q_s: &str) -> Result<String, String> {
     Ok(build_json(p, q, n, &res.lambda, &res.psi, res.ll_model, res.ll_saturated, &s, res.iterations))
 }
 
+// ─── EFA glue ──────────────────────────────────────────────────────────────
+fn efa_build_json(r: &efa::EfaResult) -> String {
+    let f = fmt_f;
+    let lam_rows: Vec<String> = (0..r.p)
+        .map(|i| format!("[{}]", (0..r.q).map(|k| f(r.lambda_rot[i * r.q + k])).collect::<Vec<_>>().join(",")))
+        .collect();
+    let lam0_rows: Vec<String> = (0..r.p)
+        .map(|i| format!("[{}]", (0..r.q).map(|k| f(r.lambda[i * r.q + k])).collect::<Vec<_>>().join(",")))
+        .collect();
+    let arr = |v: &[f64]| format!("[{}]", v.iter().map(|x| f(*x)).collect::<Vec<_>>().join(","));
+    format!(
+        "{{\"meta\":{{\"p\":{},\"q\":{},\"n\":{}}},\"method\":\"{m}\",\"rotate\":\"{rot}\",\"eigenvalues\":{ev},\"proportion_var\":{pv},\"lambda\":{l0},\"lambda_rot\":{lr},\"uniquenesses\":{u},\"communality\":{c},\"srml\":{s},\"rotate_iters\":{it}}}",
+        r.p,
+        r.q,
+        r.n,
+        m = r.method,
+        rot = r.rotate,
+        ev = arr(&r.eigenvalues),
+        pv = arr(&r.proportion_var),
+        l0 = format!("[{}]", lam0_rows.join(",")),
+        lr = format!("[{}]", lam_rows.join(",")),
+        u = arr(&r.uniquenesses),
+        c = arr(&r.communality),
+        s = f(r.srml),
+        it = r.rotate_iters,
+    )
+}
+
+fn efa_str(data_s: &str, q_s: &str, m_s: &str, rot_s: &str) -> Result<String, String> {
+    let q = parse_q(q_s).ok_or_else(|| "factors must be a positive integer".to_string())?;
+    let mut rows: Vec<Vec<f64>> = Vec::new();
+    for part in data_s.split('|') {
+        let t = part.trim();
+        if t.is_empty() {
+            continue;
+        }
+        let nums = math::parse_numbers(t).map_err(|_| "bad data numbers".to_string())?;
+        if nums.is_empty() {
+            continue;
+        }
+        rows.push(nums);
+    }
+    if rows.len() < 2 {
+        return Err("need at least 2 rows of data".to_string());
+    }
+    let p = rows[0].len();
+    for (i, r) in rows.iter().enumerate() {
+        if r.len() != p {
+            return Err(format!("row {} has {} cols, expected {}", i, r.len(), p));
+        }
+    }
+    let n = rows.len();
+    if q > p - 1 {
+        return Err("factors (q) must be < items (p)".to_string());
+    }
+    let mut flat = vec![0.0f64; n * p];
+    for (i, r) in rows.iter().enumerate() {
+        for (j, v) in r.iter().enumerate() {
+            flat[i * p + j] = *v;
+        }
+    }
+    let res = efa_fit(&flat, n, p, q, m_s, rot_s)
+        .ok_or_else(|| "EFA failed (bad method/rotate or singular)".to_string())?;
+    Ok(efa_build_json(&res))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -350,5 +459,115 @@ mod tests {
         let data = "1 2 3 | 2 3 4 | 3 4 5";
         assert!(cfa_fit_str(data, "0").is_err());
         assert!(cfa_fit_str(data, "abc").is_err());
+    }
+
+    // ─── EFA tests (against test/efa_ref.json, an independent numpy oracle) ──
+    fn efa_data_str(rows: &serde_json::Value) -> String {
+        rows.as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                r.as_array()
+                    .unwrap()
+                    .iter()
+                    .map(|x| format!("{x}"))
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect::<Vec<_>>()
+            .join("|")
+    }
+
+    fn close(a: f64, b: f64, tol: f64) -> bool {
+        (a - b).abs() <= tol
+    }
+
+    #[test]
+    fn efa_pca_varimax_matches_oracle() {
+        let ref_v: serde_json::Value =
+            serde_json::from_str(include_str!("../test/efa_ref.json")).unwrap();
+        for (idx, c) in ref_v.as_array().unwrap().iter().enumerate() {
+            let p = c["p"].as_u64().unwrap() as usize;
+            let q = c["q"].as_u64().unwrap() as usize;
+            let method = c["method"].as_str().unwrap();
+            let rotate = c["rotate"].as_str().unwrap();
+            let data = efa_data_str(&c["data"]);
+            let j = efa_str(&data, &q.to_string(), method, rotate)
+                .unwrap_or_else(|e| panic!("case {idx} {method}/{rotate}: {e}"));
+            let r: serde_json::Value = serde_json::from_str(&j).unwrap();
+            // meta
+            assert_eq!(r["meta"]["p"].as_u64().unwrap() as usize, p);
+            assert_eq!(r["meta"]["q"].as_u64().unwrap() as usize, q);
+            // eigenvalues (all p), descending
+            let ev_ref = c["eigenvalues"].as_array().unwrap();
+            let ev_got = r["eigenvalues"].as_array().unwrap();
+            for (i, (a, b)) in ev_ref.iter().zip(ev_got.iter()).enumerate() {
+                assert!(
+                    close(a.as_f64().unwrap(), b.as_f64().unwrap(), 1e-3),
+                    "case {idx} eig[{i}] {} vs {}",
+                    a,
+                    b
+                );
+            }
+            // rotated loadings p x q. Sign-normalize each factor column
+            // (max-|loading| positive) on BOTH sides so the comparison is
+            // invariant to the arbitrary eigenvector sign that "none"
+            // rotation leaves (varimax cases are already sign-fixed).
+            let lr_ref = c["loadings_rotated"].as_array().unwrap();
+            let lr_got = r["lambda_rot"].as_array().unwrap();
+            let mut maxd = 0.0f64;
+            for k in 0..q {
+                // find argmax |loading| in column k for each side
+                let argmax = |arr: &[serde_json::Value], k: usize| -> usize {
+                    let mut bi = 0;
+                    let mut bv = f64::MIN;
+                    for i in 0..p {
+                        let a = arr[i].as_array().unwrap()[k].as_f64().unwrap().abs();
+                        if a > bv {
+                            bv = a;
+                            bi = i;
+                        }
+                    }
+                    bi
+                };
+                let sr = if lr_ref[argmax(lr_ref, k)][k].as_f64().unwrap() < 0.0 {
+                    -1.0
+                } else {
+                    1.0
+                };
+                let sg = if lr_got[argmax(lr_got, k)][k].as_f64().unwrap() < 0.0 {
+                    -1.0
+                } else {
+                    1.0
+                };
+                for i in 0..p {
+                    let a = lr_ref[i].as_array().unwrap()[k].as_f64().unwrap() * sr;
+                    let b = lr_got[i].as_array().unwrap()[k].as_f64().unwrap() * sg;
+                    maxd = maxd.max((a - b).abs());
+                }
+            }
+            assert!(
+                maxd < 1e-3,
+                "case {idx} {method}/{rotate}: max |dLambda_rot| = {maxd}"
+            );
+            // uniquenesses
+            let u_ref = c["uniquenesses"].as_array().unwrap();
+            let u_got = r["uniquenesses"].as_array().unwrap();
+            for (i, (a, b)) in u_ref.iter().zip(u_got.iter()).enumerate() {
+                assert!(
+                    close(a.as_f64().unwrap(), b.as_f64().unwrap(), 1e-3),
+                    "case {idx} uni[{i}] {} vs {}",
+                    a,
+                    b
+                );
+            }
+            // srml
+            assert!(
+                close(r["srml"].as_f64().unwrap(), c["srml"].as_f64().unwrap(), 1e-3),
+                "case {idx} srml {} vs {}",
+                r["srml"],
+                c["srml"]
+            );
+        }
     }
 }
