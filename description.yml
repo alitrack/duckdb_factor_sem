@@ -1,4 +1,15 @@
-name: factor_sem_ext
-version: 0.2.1
-language: Rust
-description: Confirmatory + Exploratory Factor Analysis (CFA via FIML/ML, EFA via PCA/PA/minres + varimax/promax) — JASP Factor core
+extension:
+  name: factor_sem_ext
+  description: "Confirmatory + Exploratory Factor Analysis in DuckDB - CFA via FIML/ML, EFA via PCA/PA/minres + varimax/promax (JASP Factor core)"
+  version: 0.2.1
+  language: Rust
+  build: cargo
+  license: MIT
+  excluded_platforms: "wasm_mvp;wasm_eh;wasm_threads;linux_amd64_musl;windows_amd64_rtools;windows_amd64_mingw"
+  requires_toolchains: "rust"
+  maintainers:
+    - alitrack
+
+repo:
+  github: alitrack/duckdb_factor_sem
+  ref: refs/tags/v0.2.1
